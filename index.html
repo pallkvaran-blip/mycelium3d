@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mycelium</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #03090b; overflow: hidden; }
+    #c { display: block; width: 100vw; height: 100vh; }
+  </style>
+
+  <!-- three.js as ES modules from a CDN. No build step required. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+  import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+  import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+  import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+  import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+  import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+
+  // ============================================================
+  //  TUNING CONSTANTS  —  tweak the look here
+  // ============================================================
+  const CFG = {
+    SEED: 1337,                 // change for a different network shape
+
+    // --- network volume (ellipsoid radii) ---
+    VOL: { x: 66, y: 34, z: 66 },
+
+    // --- space colonization (network density / branching) ---
+    ATTRACTORS:  1750,          // scatter density -> more = denser network
+    SEEDS:       8,             // number of growth origins
+    SEG_LEN:     2.3,           // growth step length (smaller = finer detail)
+    INFLUENCE:   17,            // attractor influence radius
+    KILL:        4.2,           // distance at which an attractor is consumed
+    MAX_NODES:   3900,          // hard cap on network size (perf safety)
+
+    // --- filament thickness (taper) ---
+    R_TIP:       0.16,          // radius at branch tips
+    R_MAX:       1.45,          // max radius at thick base strands
+    MURRAY:      2.3,           // branch-thickness exponent (Murray's law)
+    RADIAL_SEG:  6,             // tube cross-section resolution
+    TUBE_SUBDIV: 3,             // lengthwise smoothing per segment
+
+    // --- palette (2-3 hues max) ---
+    BG:        0x03090b,        // deep near-black earth
+    COL_BASE:  0x16d2bf,        // cool cyan-teal (thick strands)
+    COL_TIP:   0xffce78,        // warm gold/amber (fruiting tips)
+    NODE_TIP:  0xffe3a6,        // glowing tip nodes
+    NODE_JUNC: 0x76f1e4,        // glowing junction nodes
+    SPORE_COL: 0x9fe9ff,        // drifting spores
+    BRIGHT_BASE: 0.48,          // emissive multiplier at base
+    BRIGHT_TIP:  0.95,          // emissive multiplier at tips (drives bloom)
+    GOLD_RANGE:  0.34,          // only filaments this thin (above R_TIP) get gold
+
+    // --- atmosphere ---
+    FOG_NEAR:  6,
+    FOG_FAR:   95,
+    EXPOSURE:  0.95,
+    BREATHE:   0.04,            // gentle exposure breathing amplitude
+
+    // --- bloom (the heavy lifter) ---
+    BLOOM_STRENGTH: 0.55,
+    BLOOM_RADIUS:   0.5,
+    BLOOM_THRESHOLD: 0.55,
+    VIGNETTE:       1.05,       // strength of edge darkening
+
+    // --- camera flight ---
+    CAM_SPEED:   0.0078,        // loop fraction per second (slow drift)
+    CAM_LOOKAHEAD: 0.013,
+    CAM_BANK:    1.5,           // banking-into-turns strength
+    CAM_MAXROLL: 0.5,
+
+    // --- life / motion ---
+    SPORES:      850,
+    PULSES:      130,           // light pulses travelling along filaments
+    NODE_PULSE_SPEED: 1.4,
+    SWAY:        0.012,         // very subtle global sway amplitude (radians)
+  };
+
+  // ============================================================
+  //  seeded RNG (mulberry32) so the shape is reproducible
+  // ============================================================
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rnd = mulberry32(CFG.SEED);
+  const rrange = (a, b) => a + (b - a) * rnd();
+
+  // ============================================================
+  //  renderer / scene / camera
+  // ============================================================
+  const canvas = document.getElementById('c');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = CFG.EXPOSURE;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(CFG.BG);
+  scene.fog = new THREE.Fog(CFG.BG, CFG.FOG_NEAR, CFG.FOG_FAR);
+
+  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 600);
+
+  const networkGroup = new THREE.Group();
+  scene.add(networkGroup);
+
+  let nodeMat = null;   // pulsing-node point material (assigned once built)
+
+  // ============================================================
+  //  1. SPACE COLONIZATION  ->  organic branching network
+  // ============================================================
+  // sample a point inside the ellipsoidal volume (rejection in unit sphere)
+  function sampleInVolume(scale = 1) {
+    let x, y, z;
+    do { x = rrange(-1, 1); y = rrange(-1, 1); z = rrange(-1, 1); }
+    while (x * x + y * y + z * z > 1);
+    return new THREE.Vector3(x * CFG.VOL.x * scale, y * CFG.VOL.y * scale, z * CFG.VOL.z * scale);
+  }
+
+  // attractors
+  const attractors = [];
+  for (let i = 0; i < CFG.ATTRACTORS; i++) attractors.push({ pos: sampleInVolume(1.0), alive: true });
+
+  // nodes: {pos, parent}
+  const nodes = [];
+  for (let i = 0; i < CFG.SEEDS; i++) {
+    nodes.push({ pos: sampleInVolume(0.6), parent: -1 });   // spread trunks through the volume
+  }
+
+  const D = CFG.SEG_LEN, DI = CFG.INFLUENCE, DK = CFG.KILL;
+  let aliveCount = attractors.length;
+  const tmp = new THREE.Vector3();
+
+  for (let iter = 0; iter < 4000 && aliveCount > 0 && nodes.length < CFG.MAX_NODES; iter++) {
+    // accumulate growth directions per node
+    const grow = new Map(); // nodeIndex -> {dir:Vector3, n:int}
+    for (const a of attractors) {
+      if (!a.alive) continue;
+      let best = -1, bestD = DI * DI;
+      for (let n = 0; n < nodes.length; n++) {
+        const dd = a.pos.distanceToSquared(nodes[n].pos);
+        if (dd < bestD) { bestD = dd; best = n; }
+      }
+      if (best >= 0) {
+        let g = grow.get(best);
+        if (!g) { g = { dir: new THREE.Vector3(), n: 0 }; grow.set(best, g); }
+        tmp.copy(a.pos).sub(nodes[best].pos).normalize();
+        g.dir.add(tmp); g.n++;
+      }
+    }
+    if (grow.size === 0) break;
+
+    // create new nodes
+    const newStart = nodes.length;
+    for (const [ni, g] of grow) {
+      if (nodes.length >= CFG.MAX_NODES) break;
+      if (g.dir.lengthSq() < 1e-9) continue;
+      g.dir.normalize();
+      // small jitter for organic feel
+      g.dir.x += rrange(-0.18, 0.18); g.dir.y += rrange(-0.18, 0.18); g.dir.z += rrange(-0.18, 0.18);
+      g.dir.normalize();
+      const np = nodes[ni].pos.clone().addScaledVector(g.dir, D);
+      nodes.push({ pos: np, parent: ni });
+    }
+
+    // kill consumed attractors (only need to test against the newly grown nodes)
+    for (const a of attractors) {
+      if (!a.alive) continue;
+      for (let n = newStart; n < nodes.length; n++) {
+        if (a.pos.distanceToSquared(nodes[n].pos) < DK * DK) { a.alive = false; aliveCount--; break; }
+      }
+    }
+  }
+
+  // children + roots
+  const children = nodes.map(() => []);
+  const roots = [];
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i].parent >= 0) children[nodes[i].parent].push(i);
+    else roots.push(i);
+  }
+
+  // depth (BFS from roots) for ordering the thickness pass
+  const depth = new Array(nodes.length).fill(0);
+  {
+    const q = [...roots];
+    for (let h = 0; h < q.length; h++) {
+      const c = q[h];
+      for (const k of children[c]) { depth[k] = depth[c] + 1; q.push(k); }
+    }
+  }
+
+  // thickness via Murray's law: r^p = sum(child r^p)
+  const thick = new Array(nodes.length).fill(CFG.R_TIP);
+  {
+    const order = [...Array(nodes.length).keys()].sort((a, b) => depth[b] - depth[a]);
+    const p = CFG.MURRAY;
+    for (const i of order) {
+      if (children[i].length === 0) { thick[i] = CFG.R_TIP; continue; }
+      let s = 0;
+      for (const k of children[i]) s += Math.pow(thick[k], p);
+      thick[i] = Math.min(CFG.R_MAX, Math.pow(s, 1 / p));
+    }
+  }
+
+  // ============================================================
+  //  2. STRANDS  ->  tapered glowing tubes
+  // ============================================================
+  // walk the tree into polyline strands (continue along thickest child)
+  const strands = [];
+  {
+    const stack = roots.map(r => ({ node: r, parent: -1 }));
+    while (stack.length) {
+      const { node, parent } = stack.pop();
+      const chain = parent >= 0 ? [parent, node] : [node];
+      let cur = node;
+      while (children[cur].length > 0) {
+        const kids = children[cur].slice().sort((a, b) => thick[b] - thick[a]);
+        for (let j = 1; j < kids.length; j++) stack.push({ node: kids[j], parent: cur });
+        cur = kids[0];
+        chain.push(cur);
+      }
+      if (chain.length >= 2) strands.push(chain);
+    }
+  }
+
+  const cBase = new THREE.Color(CFG.COL_BASE);
+  const cTip  = new THREE.Color(CFG.COL_TIP);
+
+  // map a radius -> emissive (HDR) color: only the thinnest tips warm to gold,
+  // everything thicker stays cyan-teal; tips are a touch brighter to catch bloom
+  function radiusColor(r, out) {
+    let tipness = 1 - (r - CFG.R_TIP) / CFG.GOLD_RANGE;
+    tipness = Math.min(1, Math.max(0, tipness));
+    out.copy(cBase).lerp(cTip, Math.pow(tipness, 1.3));
+    const bright = CFG.BRIGHT_BASE + (CFG.BRIGHT_TIP - CFG.BRIGHT_BASE) * Math.pow(tipness, 1.2);
+    out.multiplyScalar(bright);
+    return out;
+  }
+
+  // build a single tapered tube geometry from points + per-point radii
+  const _col = new THREE.Color();
+  function buildTube(pts, radii) {
+    // dedupe near-identical consecutive points (avoids NaN frames)
+    const P = [pts[0]], R = [radii[0]];
+    for (let i = 1; i < pts.length; i++) {
+      if (pts[i].distanceToSquared(P[P.length - 1]) > 1e-4) { P.push(pts[i]); R.push(radii[i]); }
+    }
+    if (P.length < 2) return null;
+
+    const curve = new THREE.CatmullRomCurve3(P, false, 'centripetal');
+    const segs = Math.max(2, (P.length - 1) * CFG.TUBE_SUBDIV);
+    const radial = CFG.RADIAL_SEG;
+    const frames = curve.computeFrenetFrames(segs, false);
+
+    const positions = [], colors = [], indices = [];
+    const v = new THREE.Vector3();
+
+    for (let i = 0; i <= segs; i++) {
+      const t = i / segs;
+      const point = curve.getPoint(t);
+      const N = frames.normals[i], B = frames.binormals[i];
+      // interpolate radius along the chain
+      const f = t * (P.length - 1);
+      const i0 = Math.min(P.length - 2, Math.floor(f));
+      const fr = f - i0;
+      const rInterp = R[i0] * (1 - fr) + R[i0 + 1] * fr;
+      // taper the very tip toward a point over the last stretch of the strand
+      const tipClose = 1 - 0.82 * THREE.MathUtils.smoothstep(t, 0.88, 1.0);
+      const r = rInterp * tipClose;
+      radiusColor(rInterp, _col);
+
+      for (let j = 0; j < radial; j++) {
+        const ang = (j / radial) * Math.PI * 2;
+        const cos = Math.cos(ang), sin = Math.sin(ang);
+        v.set(
+          point.x + r * (cos * N.x + sin * B.x),
+          point.y + r * (cos * N.y + sin * B.y),
+          point.z + r * (cos * N.z + sin * B.z)
+        );
+        positions.push(v.x, v.y, v.z);
+        colors.push(_col.r, _col.g, _col.b);
+      }
+    }
+
+    for (let i = 0; i < segs; i++) {
+      for (let j = 0; j < radial; j++) {
+        const a = i * radial + j;
+        const b = i * radial + ((j + 1) % radial);
+        const c = (i + 1) * radial + j;
+        const d = (i + 1) * radial + ((j + 1) % radial);
+        indices.push(a, c, b, b, c, d);
+      }
+    }
+
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    g.setIndex(indices);
+    return g;
+  }
+
+  // build all tubes and merge into one mesh
+  const tubeGeoms = [];
+  const pulseCurves = []; // for travelling light pulses
+  for (const chain of strands) {
+    const pts = chain.map(i => nodes[i].pos);
+    const radii = chain.map(i => thick[i]);
+    const g = buildTube(pts, radii);
+    if (g) tubeGeoms.push(g);
+    if (chain.length >= 4 && pulseCurves.length < CFG.PULSES * 2 && rnd() < 0.45) {
+      pulseCurves.push(new THREE.CatmullRomCurve3(pts.map(p => p.clone()), false, 'centripetal'));
+    }
+  }
+
+  const tubeMesh = new THREE.Mesh(
+    BufferGeometryUtils.mergeGeometries(tubeGeoms, false),
+    new THREE.MeshBasicMaterial({ vertexColors: true, fog: true, toneMapped: true })
+  );
+  networkGroup.add(tubeMesh);
+  tubeGeoms.forEach(g => g.dispose());
+
+  // ============================================================
+  //  3. GLOWING NODES (tips + junctions, pulsing points)
+  // ============================================================
+  function makeGlowTexture() {
+    const s = 64;
+    const cvs = document.createElement('canvas'); cvs.width = cvs.height = s;
+    const ctx = cvs.getContext('2d');
+    const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+    g.addColorStop(0.0, 'rgba(255,255,255,1)');
+    g.addColorStop(0.25, 'rgba(255,255,255,0.85)');
+    g.addColorStop(0.55, 'rgba(255,255,255,0.25)');
+    g.addColorStop(1.0, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, s, s);
+    const tex = new THREE.CanvasTexture(cvs);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+  const glowTex = makeGlowTexture();
+
+  // shared pulsing-point shader
+  function pointMaterial(size) {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        uTex: { value: glowTex },
+        uTime: { value: 0 },
+        uPix: { value: renderer.getPixelRatio() },
+        uSize: { value: size },
+        uFogColor: { value: new THREE.Color(CFG.BG) },
+        uFogNear: { value: CFG.FOG_NEAR },
+        uFogFar: { value: CFG.FOG_FAR },
+      },
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: `
+        attribute float aScale; attribute float aPhase; attribute vec3 aColor;
+        uniform float uTime, uPix, uSize;
+        varying vec3 vColor; varying float vFog;
+        uniform float uFogNear, uFogFar;
+        void main(){
+          vColor = aColor;
+          float pulse = 0.65 + 0.35 * sin(uTime * ${CFG.NODE_PULSE_SPEED.toFixed(3)} + aPhase);
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          float sz = uSize * aScale * pulse * uPix * (300.0 / max(0.001, -mv.z));
+          gl_PointSize = min(sz, 26.0 * uPix);   // clamp so near points don't blow up
+          vFog = smoothstep(uFogNear, uFogFar, -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform sampler2D uTex; uniform vec3 uFogColor;
+        varying vec3 vColor; varying float vFog;
+        void main(){
+          vec4 t = texture2D(uTex, gl_PointCoord);
+          vec3 col = vColor * t.rgb;
+          col = mix(col, uFogColor, vFog);  // fade into haze
+          gl_FragColor = vec4(col, t.a);
+        }`,
+    });
+  }
+
+  // gather node points
+  {
+    const pos = [], col = [], scl = [], pha = [];
+    const ctip = new THREE.Color(CFG.NODE_TIP), cjun = new THREE.Color(CFG.NODE_JUNC);
+    for (let i = 0; i < nodes.length; i++) {
+      const isLeaf = children[i].length === 0;
+      const isJunc = children[i].length > 1;
+      if (!isLeaf && !isJunc) continue;
+      const p = nodes[i].pos;
+      pos.push(p.x, p.y, p.z);
+      pha.push(rrange(0, Math.PI * 2));
+      if (isLeaf) { col.push(ctip.r, ctip.g, ctip.b); scl.push(rrange(0.7, 1.2)); }
+      else { col.push(cjun.r, cjun.g, cjun.b); scl.push(rrange(1.1, 1.8)); }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aColor', new THREE.Float32BufferAttribute(col, 3));
+    g.setAttribute('aScale', new THREE.Float32BufferAttribute(scl, 1));
+    g.setAttribute('aPhase', new THREE.Float32BufferAttribute(pha, 1));
+    const nodePoints = new THREE.Points(g, pointMaterial(4.5));
+    nodePoints.frustumCulled = false;
+    networkGroup.add(nodePoints);
+    nodeMat = nodePoints.material;
+  }
+  // (declared near the top; assigned above)
+
+  // ============================================================
+  //  4. TRAVELLING LIGHT PULSES along filaments (optional, cheap)
+  // ============================================================
+  let pulsePoints = null, pulseData = [];
+  if (CFG.PULSES > 0 && pulseCurves.length > 0) {
+    const n = Math.min(CFG.PULSES, pulseCurves.length);
+    const pos = new Float32Array(n * 3), col = [], scl = [], pha = [];
+    const c = new THREE.Color(CFG.COL_TIP).multiplyScalar(1.5);
+    for (let i = 0; i < n; i++) {
+      const ci = Math.floor(rnd() * pulseCurves.length);
+      pulseData.push({ curve: pulseCurves[ci], off: rnd(), spd: rrange(0.05, 0.13) });
+      col.push(c.r, c.g, c.b); scl.push(rrange(0.8, 1.4)); pha.push(0);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('aColor', new THREE.Float32BufferAttribute(col, 3));
+    g.setAttribute('aScale', new THREE.Float32BufferAttribute(scl, 1));
+    g.setAttribute('aPhase', new THREE.Float32BufferAttribute(pha, 1));
+    const mat = pointMaterial(6.0);
+    mat.uniforms.uTime.value = 0;
+    pulsePoints = new THREE.Points(g, mat);
+    pulsePoints.frustumCulled = false;
+    networkGroup.add(pulsePoints);
+  }
+
+  // ============================================================
+  //  5. FLOATING SPORES (drifting motes)
+  // ============================================================
+  let sporeMat;
+  {
+    const n = CFG.SPORES;
+    const pos = [], col = [], scl = [], pha = [], amp = [];
+    const base = new THREE.Color(CFG.SPORE_COL);
+    for (let i = 0; i < n; i++) {
+      const p = sampleInVolume(1.12);
+      pos.push(p.x, p.y, p.z);
+      const tint = base.clone().lerp(cTip, rnd() * 0.25);
+      col.push(tint.r, tint.g, tint.b);
+      scl.push(rrange(0.4, 1.3)); pha.push(rrange(0, Math.PI * 2)); amp.push(rrange(0.6, 2.4));
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aColor', new THREE.Float32BufferAttribute(col, 3));
+    g.setAttribute('aScale', new THREE.Float32BufferAttribute(scl, 1));
+    g.setAttribute('aPhase', new THREE.Float32BufferAttribute(pha, 1));
+    g.setAttribute('aAmp', new THREE.Float32BufferAttribute(amp, 1));
+    sporeMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTex: { value: glowTex }, uTime: { value: 0 }, uPix: { value: renderer.getPixelRatio() },
+        uFogColor: { value: new THREE.Color(CFG.BG) }, uFogNear: { value: CFG.FOG_NEAR }, uFogFar: { value: CFG.FOG_FAR },
+      },
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: `
+        attribute float aScale; attribute float aPhase; attribute float aAmp; attribute vec3 aColor;
+        uniform float uTime, uPix; uniform float uFogNear, uFogFar;
+        varying vec3 vColor; varying float vFog; varying float vTw;
+        void main(){
+          vColor = aColor;
+          vec3 p = position;
+          // slow weightless drift
+          p.x += aAmp * sin(uTime * 0.18 + aPhase);
+          p.y += aAmp * 0.8 * sin(uTime * 0.13 + aPhase * 1.7);
+          p.z += aAmp * cos(uTime * 0.16 + aPhase * 0.6);
+          vTw = 0.55 + 0.45 * sin(uTime * 0.9 + aPhase * 3.0); // twinkle
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          float sz = 4.0 * aScale * uPix * (300.0 / max(0.001, -mv.z));
+          gl_PointSize = min(sz, 16.0 * uPix);
+          vFog = smoothstep(uFogNear, uFogFar, -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform sampler2D uTex; uniform vec3 uFogColor;
+        varying vec3 vColor; varying float vFog; varying float vTw;
+        void main(){
+          vec4 t = texture2D(uTex, gl_PointCoord);
+          vec3 col = vColor * t.rgb * vTw;
+          col = mix(col, uFogColor, vFog);
+          gl_FragColor = vec4(col, t.a * (1.0 - vFog * 0.85));
+        }`,
+    });
+    const spores = new THREE.Points(g, sporeMat);
+    spores.frustumCulled = false;
+    scene.add(spores);
+  }
+
+  // ============================================================
+  //  6. CAMERA FLIGHT PATH (closed Catmull-Rom through network)
+  // ============================================================
+  const camPts = [];
+  {
+    const loops = 10;
+    for (let i = 0; i < loops; i++) {
+      const a = (i / loops) * Math.PI * 2;
+      const rad = rrange(0.28, 0.52);   // weave through the populated interior
+      camPts.push(new THREE.Vector3(
+        Math.cos(a) * CFG.VOL.x * rad,
+        Math.sin(a * 1.7 + 0.5) * CFG.VOL.y * 0.42 + rrange(-5, 5),
+        Math.sin(a) * CFG.VOL.z * rad
+      ));
+    }
+  }
+  // Keep the path a clearance distance from medium/thick strands so the camera
+  // grazes them beautifully but never flies *inside* a tube. We relax against
+  // points sampled along the actual spline (not just control points) so the
+  // curve's bulges between control points are accounted for too.
+  const trunks = [];
+  for (let i = 0; i < nodes.length; i++) if (thick[i] > 0.32) trunks.push(nodes[i].pos);
+  const MINCLEAR = 9;
+  let camCurve = new THREE.CatmullRomCurve3(camPts, true, 'catmullrom', 0.5);
+  if (trunks.length) {
+    const away = new THREE.Vector3(), sp = new THREE.Vector3();
+    for (let pass = 0; pass < 8; pass++) {
+      let moved = false;
+      const N = 260;
+      for (let s = 0; s < N; s++) {
+        camCurve.getPoint(s / N, sp);
+        let near = null, nd = Infinity;
+        for (const tp of trunks) { const d = sp.distanceToSquared(tp); if (d < nd) { nd = d; near = tp; } }
+        nd = Math.sqrt(nd);
+        if (nd >= MINCLEAR) continue;
+        // nudge the nearest control point away from this trunk
+        let ci = 0, cd = Infinity;
+        for (let k = 0; k < camPts.length; k++) { const d = camPts[k].distanceToSquared(sp); if (d < cd) { cd = d; ci = k; } }
+        away.copy(camPts[ci]).sub(near);
+        if (away.lengthSq() < 1e-6) away.set(rrange(-1, 1), rrange(-1, 1), rrange(-1, 1));
+        camPts[ci].addScaledVector(away.normalize(), (MINCLEAR - nd) * 0.5);
+        moved = true;
+      }
+      camCurve = new THREE.CatmullRomCurve3(camPts, true, 'catmullrom', 0.5);
+      if (!moved) break;
+    }
+  }
+
+  const worldUp = new THREE.Vector3(0, 1, 0);
+  const _pos = new THREE.Vector3(), _ahead = new THREE.Vector3(), _prev = new THREE.Vector3();
+  const _tan = new THREE.Vector3(), _accel = new THREE.Vector3(), _right = new THREE.Vector3(), _up = new THREE.Vector3();
+  const _look = new THREE.Vector3();
+
+  function updateCamera(t) {
+    const lt = ((t * CFG.CAM_SPEED) % 1 + 1) % 1;
+    camCurve.getPointAt(lt, _pos);
+    camCurve.getPointAt((lt + CFG.CAM_LOOKAHEAD) % 1, _ahead);
+    camCurve.getPointAt((lt - 0.01 + 1) % 1, _prev);
+
+    _tan.copy(_ahead).sub(_pos).normalize();
+    // lateral acceleration -> bank into turns
+    _accel.copy(_ahead).add(_prev).addScaledVector(_pos, -2);
+    _right.copy(_tan).cross(worldUp).normalize();
+    let roll = THREE.MathUtils.clamp(_accel.dot(_right) * CFG.CAM_BANK, -CFG.CAM_MAXROLL, CFG.CAM_MAXROLL);
+
+    _up.copy(worldUp).applyAxisAngle(_tan, roll).normalize();
+    camera.position.copy(_pos);
+    camera.up.copy(_up);
+    camCurve.getPointAt((lt + CFG.CAM_LOOKAHEAD * 1.6) % 1, _look);
+    camera.lookAt(_look);
+  }
+
+  // ============================================================
+  //  7. POST-PROCESSING: bloom + vignette
+  // ============================================================
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+
+  const bloom = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    CFG.BLOOM_STRENGTH, CFG.BLOOM_RADIUS, CFG.BLOOM_THRESHOLD
+  );
+  composer.addPass(bloom);
+  composer.addPass(new OutputPass());
+
+  const VignetteShader = {
+    uniforms: { tDiffuse: { value: null }, uAmount: { value: CFG.VIGNETTE } },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform sampler2D tDiffuse; uniform float uAmount; varying vec2 vUv;
+      void main(){
+        vec4 c = texture2D(tDiffuse, vUv);
+        vec2 d = vUv - 0.5;
+        float v = smoothstep(0.85, 0.25, dot(d, d) * uAmount * 2.0);
+        c.rgb *= mix(0.35, 1.0, v);
+        gl_FragColor = c;
+      }`,
+  };
+  composer.addPass(new ShaderPass(VignetteShader));
+
+  // ============================================================
+  //  resize
+  // ============================================================
+  function onResize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    const pr = Math.min(window.devicePixelRatio, 2);
+    renderer.setPixelRatio(pr);
+    renderer.setSize(w, h);
+    composer.setPixelRatio(pr);
+    composer.setSize(w, h);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+    bloom.setSize(w, h);
+    if (nodeMat) nodeMat.uniforms.uPix.value = pr;
+    if (pulsePoints) pulsePoints.material.uniforms.uPix.value = pr;
+    if (sporeMat) sporeMat.uniforms.uPix.value = pr;
+  }
+  window.addEventListener('resize', onResize);
+
+  // ============================================================
+  //  animation loop
+  // ============================================================
+  const clock = new THREE.Clock();
+  const _pp = new THREE.Vector3();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+
+    updateCamera(t);
+
+    // gentle global breathing of light
+    renderer.toneMappingExposure = CFG.EXPOSURE + CFG.BREATHE * Math.sin(t * 0.3);
+
+    // very subtle sway of the whole network (camera is inside it)
+    networkGroup.rotation.y = CFG.SWAY * Math.sin(t * 0.08);
+    networkGroup.rotation.x = CFG.SWAY * 0.6 * Math.sin(t * 0.061 + 1.3);
+
+    if (nodeMat) nodeMat.uniforms.uTime.value = t;
+    if (sporeMat) sporeMat.uniforms.uTime.value = t;
+
+    // travelling pulses
+    if (pulsePoints) {
+      const arr = pulsePoints.geometry.attributes.position.array;
+      for (let i = 0; i < pulseData.length; i++) {
+        const d = pulseData[i];
+        const u = ((t * d.spd + d.off) % 1 + 1) % 1;
+        d.curve.getPointAt(u, _pp);
+        arr[i * 3] = _pp.x; arr[i * 3 + 1] = _pp.y; arr[i * 3 + 2] = _pp.z;
+      }
+      pulsePoints.geometry.attributes.position.needsUpdate = true;
+      pulsePoints.material.uniforms.uTime.value = t;
+    }
+
+    composer.render();
+  }
+  animate();
+  </script>
+</body>
+</html>
