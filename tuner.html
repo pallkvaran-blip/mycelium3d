@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Mycelium — palette</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #03090b; overflow: hidden; }
+    #c { display: block; width: 100vw; height: 100vh; }
+
+    /* ---- palette control panel ---- */
+    :root {
+      --ink: #cdeee8;
+      --teal: #76f1e4;
+      --muted: #5f8b86;
+      --glass: rgba(5, 16, 18, 0.74);
+      --line: rgba(118, 241, 228, 0.18);
+    }
+    #panel {
+      position: fixed; top: 14px; right: 14px; z-index: 10;
+      width: 248px; max-height: calc(100vh - 28px);
+      display: flex; flex-direction: column;
+      background: var(--glass);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      backdrop-filter: blur(9px) saturate(1.1);
+      -webkit-backdrop-filter: blur(9px) saturate(1.1);
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.04);
+      color: var(--ink);
+      font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      overflow: hidden;
+    }
+    #panel header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 11px 13px;
+      cursor: pointer; user-select: none;
+      border-bottom: 1px solid var(--line);
+    }
+    #panel header .title {
+      letter-spacing: 0.22em; text-transform: uppercase; font-size: 11px;
+      color: var(--teal);
+    }
+    #panel header .chev { color: var(--muted); transition: transform .25s ease; }
+    #panel.collapsed header .chev { transform: rotate(-90deg); }
+    #panel.collapsed .body { display: none; }
+    .body { overflow-y: auto; padding: 6px 13px 13px; }
+    .body::-webkit-scrollbar { width: 8px; }
+    .body::-webkit-scrollbar-thumb { background: var(--line); border-radius: 8px; }
+
+    .group { padding: 11px 0 4px; border-top: 1px solid rgba(118,241,228,0.08); }
+    .group:first-child { border-top: 0; }
+    .group > .row-head {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    }
+    .swatch {
+      width: 16px; height: 16px; border-radius: 4px; flex: 0 0 auto;
+      border: 1px solid rgba(255,255,255,0.22);
+      box-shadow: 0 0 10px rgba(0,0,0,0.4);
+    }
+    .group .label {
+      text-transform: uppercase; letter-spacing: 0.14em; font-size: 10.5px;
+      color: var(--ink);
+    }
+    .sub { color: var(--muted); font-size: 10px; letter-spacing: 0.1em; }
+
+    .ctl { display: grid; grid-template-columns: 18px 1fr 34px; align-items: center; gap: 8px; margin: 6px 0; }
+    .ctl .k { color: var(--muted); font-size: 10px; }
+    .ctl .v { color: var(--ink); font-size: 10px; text-align: right; font-variant-numeric: tabular-nums; }
+
+    input[type=range] {
+      -webkit-appearance: none; appearance: none; width: 100%; height: 3px;
+      background: linear-gradient(90deg, var(--muted), var(--teal));
+      border-radius: 3px; outline: none; margin: 0;
+    }
+    input[type=range]:focus-visible { box-shadow: 0 0 0 2px rgba(118,241,228,0.5); border-radius: 6px; }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+      border-radius: 50%; background: #eafffb; border: 2px solid #0b1c1e;
+      box-shadow: 0 0 8px rgba(118,241,228,0.7); cursor: pointer;
+    }
+    input[type=range]::-moz-range-thumb {
+      width: 14px; height: 14px; border-radius: 50%; background: #eafffb;
+      border: 2px solid #0b1c1e; box-shadow: 0 0 8px rgba(118,241,228,0.7); cursor: pointer;
+    }
+    #reset {
+      margin-top: 12px; width: 100%; padding: 8px;
+      background: transparent; color: var(--teal);
+      border: 1px solid var(--line); border-radius: 8px;
+      font: inherit; letter-spacing: 0.18em; text-transform: uppercase; font-size: 10px;
+      cursor: pointer; transition: background .2s ease;
+    }
+    #reset:hover { background: rgba(118,241,228,0.08); }
+    #reset:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+  </style>
+
+  <!-- three.js as ES modules from a CDN. No build step required. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+  import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+  import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+  import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+  import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+  import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+
+  // ============================================================
+  //  TUNING CONSTANTS  (these are the panel's starting values)
+  // ============================================================
+  const CFG = {
+    SEED: 1337,
+    VOL: { x: 66, y: 34, z: 66 },
+
+    ATTRACTORS:  1750, SEEDS: 8, SEG_LEN: 2.3, INFLUENCE: 17, KILL: 4.2, MAX_NODES: 3900,
+
+    R_TIP: 0.16, R_MAX: 1.45, MURRAY: 2.3, RADIAL_SEG: 6, TUBE_SUBDIV: 3,
+
+    // --- palette (live-adjustable from the panel) ---
+    BG:        0x03090b,
+    COL_BASE:  0x16d2bf,
+    COL_TIP:   0xffce78,
+    NODE_JUNC: 0x76f1e4,
+    SPORE_COL: 0x9fe9ff,
+    BRIGHT_BASE: 0.40,
+    BRIGHT_TIP:  0.70,
+    GOLD_RANGE:  0.34,
+
+    FOG_NEAR: 6, FOG_FAR: 95, EXPOSURE: 0.85, BREATHE: 0.04,
+    BLOOM_STRENGTH: 0.42, BLOOM_RADIUS: 0.5, BLOOM_THRESHOLD: 0.6, VIGNETTE: 1.05,
+
+    CAM_SPEED: 0.0078, CAM_LOOKAHEAD: 0.013, CAM_BANK: 1.5, CAM_MAXROLL: 0.5,
+    SPORES: 850, PULSES: 130, NODE_PULSE_SPEED: 1.4, SWAY: 0.012,
+  };
+
+  // live look values the animation loop / panel read & write
+  const look = { exposure: CFG.EXPOSURE };
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ============================================================
+  //  seeded RNG (mulberry32) so the shape is reproducible
+  // ============================================================
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rnd = mulberry32(CFG.SEED);
+  const rrange = (a, b) => a + (b - a) * rnd();
+
+  // ============================================================
+  //  renderer / scene / camera
+  // ============================================================
+  const canvas = document.getElementById('c');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = CFG.EXPOSURE;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(CFG.BG);
+  scene.fog = new THREE.Fog(CFG.BG, CFG.FOG_NEAR, CFG.FOG_FAR);
+
+  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 600);
+
+  const networkGroup = new THREE.Group();
+  scene.add(networkGroup);
+
+  let nodeMat = null, pulseMat = null, sporeMat = null, tubeMat = null;
+
+  // ============================================================
+  //  1. SPACE COLONIZATION  ->  organic branching network
+  // ============================================================
+  function sampleInVolume(scale = 1) {
+    let x, y, z;
+    do { x = rrange(-1, 1); y = rrange(-1, 1); z = rrange(-1, 1); }
+    while (x * x + y * y + z * z > 1);
+    return new THREE.Vector3(x * CFG.VOL.x * scale, y * CFG.VOL.y * scale, z * CFG.VOL.z * scale);
+  }
+
+  const attractors = [];
+  for (let i = 0; i < CFG.ATTRACTORS; i++) attractors.push({ pos: sampleInVolume(1.0), alive: true });
+
+  const nodes = [];
+  for (let i = 0; i < CFG.SEEDS; i++) nodes.push({ pos: sampleInVolume(0.6), parent: -1 });
+
+  const D = CFG.SEG_LEN, DI = CFG.INFLUENCE, DK = CFG.KILL;
+  let aliveCount = attractors.length;
+  const tmp = new THREE.Vector3();
+
+  for (let iter = 0; iter < 4000 && aliveCount > 0 && nodes.length < CFG.MAX_NODES; iter++) {
+    const grow = new Map();
+    for (const a of attractors) {
+      if (!a.alive) continue;
+      let best = -1, bestD = DI * DI;
+      for (let n = 0; n < nodes.length; n++) {
+        const dd = a.pos.distanceToSquared(nodes[n].pos);
+        if (dd < bestD) { bestD = dd; best = n; }
+      }
+      if (best >= 0) {
+        let g = grow.get(best);
+        if (!g) { g = { dir: new THREE.Vector3(), n: 0 }; grow.set(best, g); }
+        tmp.copy(a.pos).sub(nodes[best].pos).normalize();
+        g.dir.add(tmp); g.n++;
+      }
+    }
+    if (grow.size === 0) break;
+
+    const newStart = nodes.length;
+    for (const [ni, g] of grow) {
+      if (nodes.length >= CFG.MAX_NODES) break;
+      if (g.dir.lengthSq() < 1e-9) continue;
+      g.dir.normalize();
+      g.dir.x += rrange(-0.18, 0.18); g.dir.y += rrange(-0.18, 0.18); g.dir.z += rrange(-0.18, 0.18);
+      g.dir.normalize();
+      nodes.push({ pos: nodes[ni].pos.clone().addScaledVector(g.dir, D), parent: ni });
+    }
+
+    for (const a of attractors) {
+      if (!a.alive) continue;
+      for (let n = newStart; n < nodes.length; n++) {
+        if (a.pos.distanceToSquared(nodes[n].pos) < DK * DK) { a.alive = false; aliveCount--; break; }
+      }
+    }
+  }
+
+  const children = nodes.map(() => []);
+  const roots = [];
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i].parent >= 0) children[nodes[i].parent].push(i);
+    else roots.push(i);
+  }
+
+  const depth = new Array(nodes.length).fill(0);
+  {
+    const q = [...roots];
+    for (let h = 0; h < q.length; h++) {
+      const c = q[h];
+      for (const k of children[c]) { depth[k] = depth[c] + 1; q.push(k); }
+    }
+  }
+
+  const thick = new Array(nodes.length).fill(CFG.R_TIP);
+  {
+    const order = [...Array(nodes.length).keys()].sort((a, b) => depth[b] - depth[a]);
+    const p = CFG.MURRAY;
+    for (const i of order) {
+      if (children[i].length === 0) { thick[i] = CFG.R_TIP; continue; }
+      let s = 0;
+      for (const k of children[i]) s += Math.pow(thick[k], p);
+      thick[i] = Math.min(CFG.R_MAX, Math.pow(s, 1 / p));
+    }
+  }
+
+  // ============================================================
+  //  2. STRANDS  ->  tapered tubes (colour computed in-shader so
+  //     the palette stays fully live-adjustable)
+  // ============================================================
+  const strands = [];
+  {
+    const stack = roots.map(r => ({ node: r, parent: -1 }));
+    while (stack.length) {
+      const { node, parent } = stack.pop();
+      const chain = parent >= 0 ? [parent, node] : [node];
+      let cur = node;
+      while (children[cur].length > 0) {
+        const kids = children[cur].slice().sort((a, b) => thick[b] - thick[a]);
+        for (let j = 1; j < kids.length; j++) stack.push({ node: kids[j], parent: cur });
+        cur = kids[0];
+        chain.push(cur);
+      }
+      if (chain.length >= 2) strands.push(chain);
+    }
+  }
+
+  // build a single tapered tube geometry; bakes a per-vertex radius (aR)
+  function buildTube(pts, radii) {
+    const P = [pts[0]], R = [radii[0]];
+    for (let i = 1; i < pts.length; i++) {
+      if (pts[i].distanceToSquared(P[P.length - 1]) > 1e-4) { P.push(pts[i]); R.push(radii[i]); }
+    }
+    if (P.length < 2) return null;
+
+    const curve = new THREE.CatmullRomCurve3(P, false, 'centripetal');
+    const segs = Math.max(2, (P.length - 1) * CFG.TUBE_SUBDIV);
+    const radial = CFG.RADIAL_SEG;
+    const frames = curve.computeFrenetFrames(segs, false);
+
+    const positions = [], aR = [], indices = [];
+    const v = new THREE.Vector3();
+
+    for (let i = 0; i <= segs; i++) {
+      const t = i / segs;
+      const point = curve.getPoint(t);
+      const N = frames.normals[i], B = frames.binormals[i];
+      const f = t * (P.length - 1);
+      const i0 = Math.min(P.length - 2, Math.floor(f));
+      const fr = f - i0;
+      const rInterp = R[i0] * (1 - fr) + R[i0 + 1] * fr;
+      const tipClose = 1 - 0.97 * THREE.MathUtils.smoothstep(t, 0.78, 1.0);
+      const r = rInterp * tipClose;
+
+      for (let j = 0; j < radial; j++) {
+        const ang = (j / radial) * Math.PI * 2;
+        const cos = Math.cos(ang), sin = Math.sin(ang);
+        v.set(
+          point.x + r * (cos * N.x + sin * B.x),
+          point.y + r * (cos * N.y + sin * B.y),
+          point.z + r * (cos * N.z + sin * B.z)
+        );
+        positions.push(v.x, v.y, v.z);
+        aR.push(rInterp);
+      }
+    }
+
+    for (let i = 0; i < segs; i++) {
+      for (let j = 0; j < radial; j++) {
+        const a = i * radial + j;
+        const b = i * radial + ((j + 1) % radial);
+        const c = (i + 1) * radial + j;
+        const d = (i + 1) * radial + ((j + 1) % radial);
+        indices.push(a, c, b, b, c, d);
+      }
+    }
+
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    g.setAttribute('aR', new THREE.Float32BufferAttribute(aR, 1));
+    g.setIndex(indices);
+    return g;
+  }
+
+  const tubeGeoms = [];
+  const pulseCurves = [];
+  for (const chain of strands) {
+    const pts = chain.map(i => nodes[i].pos);
+    const radii = chain.map(i => thick[i]);
+    const g = buildTube(pts, radii);
+    if (g) tubeGeoms.push(g);
+    if (chain.length >= 4 && pulseCurves.length < CFG.PULSES * 2 && rnd() < 0.45) {
+      pulseCurves.push(new THREE.CatmullRomCurve3(pts.map(p => p.clone()), false, 'centripetal'));
+    }
+  }
+
+  // tube material: tip-warmth + brightness derived from aR, all via uniforms
+  tubeMat = new THREE.ShaderMaterial({
+    fog: true,
+    uniforms: THREE.UniformsUtils.merge([
+      THREE.UniformsLib.fog,
+      {
+        uBase:       { value: new THREE.Color(CFG.COL_BASE) },
+        uTip:        { value: new THREE.Color(CFG.COL_TIP) },
+        uBrightBase: { value: CFG.BRIGHT_BASE },
+        uBrightTip:  { value: CFG.BRIGHT_TIP },
+        uGoldRange:  { value: CFG.GOLD_RANGE },
+        uRTip:       { value: CFG.R_TIP },
+      },
+    ]),
+    vertexShader: `
+      #include <common>
+      #include <fog_pars_vertex>
+      attribute float aR;
+      uniform vec3 uBase, uTip;
+      uniform float uBrightBase, uBrightTip, uGoldRange, uRTip;
+      varying vec3 vColor;
+      void main() {
+        float tip = clamp(1.0 - (aR - uRTip) / uGoldRange, 0.0, 1.0);
+        vec3 col = mix(uBase, uTip, pow(tip, 1.3));
+        float bright = mix(uBrightBase, uBrightTip, pow(tip, 1.2));
+        vColor = col * bright;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
+      }`,
+    fragmentShader: `
+      #include <common>
+      #include <fog_pars_fragment>
+      varying vec3 vColor;
+      void main() {
+        gl_FragColor = vec4(vColor, 1.0);
+        #include <fog_fragment>
+      }`,
+  });
+
+  const tubeMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(tubeGeoms, false), tubeMat);
+  networkGroup.add(tubeMesh);
+  tubeGeoms.forEach(g => g.dispose());
+
+  // ============================================================
+  //  3. GLOWING NODES (intersections only) + travelling pulses
+  // ============================================================
+  function makeGlowTexture() {
+    const s = 64;
+    const cvs = document.createElement('canvas'); cvs.width = cvs.height = s;
+    const ctx = cvs.getContext('2d');
+    const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+    g.addColorStop(0.0, 'rgba(255,255,255,1)');
+    g.addColorStop(0.25, 'rgba(255,255,255,0.85)');
+    g.addColorStop(0.55, 'rgba(255,255,255,0.25)');
+    g.addColorStop(1.0, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, s, s);
+    const tex = new THREE.CanvasTexture(cvs);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+  const glowTex = makeGlowTexture();
+
+  // shared pulsing-point shader; colour comes from the uTint uniform
+  function pointMaterial(size, tint) {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        uTex: { value: glowTex }, uTime: { value: 0 }, uPix: { value: renderer.getPixelRatio() },
+        uSize: { value: size }, uTint: { value: tint.clone() },
+        uFogColor: { value: new THREE.Color(CFG.BG) }, uFogNear: { value: CFG.FOG_NEAR }, uFogFar: { value: CFG.FOG_FAR },
+      },
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: `
+        attribute float aScale; attribute float aPhase;
+        uniform float uTime, uPix, uSize, uFogNear, uFogFar;
+        varying float vFog;
+        void main(){
+          float pulse = 0.65 + 0.35 * sin(uTime * ${CFG.NODE_PULSE_SPEED.toFixed(3)} + aPhase);
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          float sz = uSize * aScale * pulse * uPix * (300.0 / max(0.001, -mv.z));
+          gl_PointSize = min(sz, 26.0 * uPix);
+          vFog = smoothstep(uFogNear, uFogFar, -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform sampler2D uTex; uniform vec3 uFogColor, uTint;
+        varying float vFog;
+        void main(){
+          vec4 t = texture2D(uTex, gl_PointCoord);
+          vec3 col = mix(uTint * t.rgb, uFogColor, vFog);
+          gl_FragColor = vec4(col, t.a);
+        }`,
+    });
+  }
+
+  // node points — intersections only (tips stay pointy)
+  {
+    const pos = [], scl = [], pha = [];
+    for (let i = 0; i < nodes.length; i++) {
+      if (children[i].length <= 1) continue;
+      const p = nodes[i].pos;
+      pos.push(p.x, p.y, p.z);
+      pha.push(rrange(0, Math.PI * 2));
+      scl.push(rrange(1.1, 1.8));
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aScale', new THREE.Float32BufferAttribute(scl, 1));
+    g.setAttribute('aPhase', new THREE.Float32BufferAttribute(pha, 1));
+    const nodePoints = new THREE.Points(g, pointMaterial(4.5, new THREE.Color(CFG.NODE_JUNC)));
+    nodePoints.frustumCulled = false;
+    networkGroup.add(nodePoints);
+    nodeMat = nodePoints.material;
+  }
+
+  // ============================================================
+  //  4. TRAVELLING LIGHT PULSES along filaments
+  // ============================================================
+  let pulsePoints = null, pulseData = [];
+  if (CFG.PULSES > 0 && pulseCurves.length > 0) {
+    const n = Math.min(CFG.PULSES, pulseCurves.length);
+    const pos = new Float32Array(n * 3), scl = [], pha = [];
+    for (let i = 0; i < n; i++) {
+      const ci = Math.floor(rnd() * pulseCurves.length);
+      pulseData.push({ curve: pulseCurves[ci], off: rnd(), spd: rrange(0.05, 0.13) });
+      scl.push(rrange(0.8, 1.4)); pha.push(0);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('aScale', new THREE.Float32BufferAttribute(scl, 1));
+    g.setAttribute('aPhase', new THREE.Float32BufferAttribute(pha, 1));
+    pulseMat = pointMaterial(6.0, new THREE.Color(CFG.COL_TIP).multiplyScalar(1.5));
+    pulsePoints = new THREE.Points(g, pulseMat);
+    pulsePoints.frustumCulled = false;
+    networkGroup.add(pulsePoints);
+  }
+
+  // ============================================================
+  //  5. FLOATING SPORES (drifting motes)
+  // ============================================================
+  {
+    const n = CFG.SPORES;
+    const pos = [], bri = [], scl = [], pha = [], amp = [];
+    for (let i = 0; i < n; i++) {
+      const p = sampleInVolume(1.12);
+      pos.push(p.x, p.y, p.z);
+      bri.push(rrange(0.7, 1.1));    // per-mote brightness variation
+      scl.push(rrange(0.4, 1.3)); pha.push(rrange(0, Math.PI * 2)); amp.push(rrange(0.6, 2.4));
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aBri', new THREE.Float32BufferAttribute(bri, 1));
+    g.setAttribute('aScale', new THREE.Float32BufferAttribute(scl, 1));
+    g.setAttribute('aPhase', new THREE.Float32BufferAttribute(pha, 1));
+    g.setAttribute('aAmp', new THREE.Float32BufferAttribute(amp, 1));
+    sporeMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTex: { value: glowTex }, uTime: { value: 0 }, uPix: { value: renderer.getPixelRatio() },
+        uTint: { value: new THREE.Color(CFG.SPORE_COL) },
+        uFogColor: { value: new THREE.Color(CFG.BG) }, uFogNear: { value: CFG.FOG_NEAR }, uFogFar: { value: CFG.FOG_FAR },
+      },
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: `
+        attribute float aScale, aPhase, aAmp, aBri;
+        uniform float uTime, uPix, uFogNear, uFogFar;
+        varying float vFog, vTw, vBri;
+        void main(){
+          vBri = aBri;
+          vec3 p = position;
+          p.x += aAmp * sin(uTime * 0.18 + aPhase);
+          p.y += aAmp * 0.8 * sin(uTime * 0.13 + aPhase * 1.7);
+          p.z += aAmp * cos(uTime * 0.16 + aPhase * 0.6);
+          vTw = 0.55 + 0.45 * sin(uTime * 0.9 + aPhase * 3.0);
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          float sz = 4.0 * aScale * uPix * (300.0 / max(0.001, -mv.z));
+          gl_PointSize = min(sz, 16.0 * uPix);
+          vFog = smoothstep(uFogNear, uFogFar, -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform sampler2D uTex; uniform vec3 uFogColor, uTint;
+        varying float vFog, vTw, vBri;
+        void main(){
+          vec4 t = texture2D(uTex, gl_PointCoord);
+          vec3 col = mix(uTint * t.rgb * vTw * vBri, uFogColor, vFog);
+          gl_FragColor = vec4(col, t.a * (1.0 - vFog * 0.85));
+        }`,
+    });
+    const spores = new THREE.Points(g, sporeMat);
+    spores.frustumCulled = false;
+    scene.add(spores);
+  }
+
+  // ============================================================
+  //  6. CAMERA FLIGHT PATH (closed Catmull-Rom through network)
+  // ============================================================
+  const camPts = [];
+  {
+    const loops = 10;
+    for (let i = 0; i < loops; i++) {
+      const a = (i / loops) * Math.PI * 2;
+      const rad = rrange(0.28, 0.52);
+      camPts.push(new THREE.Vector3(
+        Math.cos(a) * CFG.VOL.x * rad,
+        Math.sin(a * 1.7 + 0.5) * CFG.VOL.y * 0.42 + rrange(-5, 5),
+        Math.sin(a) * CFG.VOL.z * rad
+      ));
+    }
+  }
+  const trunks = [];
+  for (let i = 0; i < nodes.length; i++) if (thick[i] > 0.32) trunks.push(nodes[i].pos);
+  const MINCLEAR = 9;
+  let camCurve = new THREE.CatmullRomCurve3(camPts, true, 'catmullrom', 0.5);
+  if (trunks.length) {
+    const away = new THREE.Vector3(), sp = new THREE.Vector3();
+    for (let pass = 0; pass < 8; pass++) {
+      let moved = false;
+      const N = 260;
+      for (let s = 0; s < N; s++) {
+        camCurve.getPoint(s / N, sp);
+        let near = null, nd = Infinity;
+        for (const tp of trunks) { const d = sp.distanceToSquared(tp); if (d < nd) { nd = d; near = tp; } }
+        nd = Math.sqrt(nd);
+        if (nd >= MINCLEAR) continue;
+        let ci = 0, cd = Infinity;
+        for (let k = 0; k < camPts.length; k++) { const d = camPts[k].distanceToSquared(sp); if (d < cd) { cd = d; ci = k; } }
+        away.copy(camPts[ci]).sub(near);
+        if (away.lengthSq() < 1e-6) away.set(rrange(-1, 1), rrange(-1, 1), rrange(-1, 1));
+        camPts[ci].addScaledVector(away.normalize(), (MINCLEAR - nd) * 0.5);
+        moved = true;
+      }
+      camCurve = new THREE.CatmullRomCurve3(camPts, true, 'catmullrom', 0.5);
+      if (!moved) break;
+    }
+  }
+
+  const worldUp = new THREE.Vector3(0, 1, 0);
+  const _pos = new THREE.Vector3(), _ahead = new THREE.Vector3(), _prev = new THREE.Vector3();
+  const _tan = new THREE.Vector3(), _accel = new THREE.Vector3(), _right = new THREE.Vector3(), _up = new THREE.Vector3();
+  const _look = new THREE.Vector3();
+
+  function updateCamera(t) {
+    const lt = ((t * CFG.CAM_SPEED) % 1 + 1) % 1;
+    camCurve.getPointAt(lt, _pos);
+    camCurve.getPointAt((lt + CFG.CAM_LOOKAHEAD) % 1, _ahead);
+    camCurve.getPointAt((lt - 0.01 + 1) % 1, _prev);
+    _tan.copy(_ahead).sub(_pos).normalize();
+    _accel.copy(_ahead).add(_prev).addScaledVector(_pos, -2);
+    _right.copy(_tan).cross(worldUp).normalize();
+    const roll = THREE.MathUtils.clamp(_accel.dot(_right) * CFG.CAM_BANK, -CFG.CAM_MAXROLL, CFG.CAM_MAXROLL);
+    _up.copy(worldUp).applyAxisAngle(_tan, roll).normalize();
+    camera.position.copy(_pos);
+    camera.up.copy(_up);
+    camCurve.getPointAt((lt + CFG.CAM_LOOKAHEAD * 1.6) % 1, _look);
+    camera.lookAt(_look);
+  }
+
+  // ============================================================
+  //  7. POST-PROCESSING: bloom + vignette
+  // ============================================================
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloom = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    CFG.BLOOM_STRENGTH, CFG.BLOOM_RADIUS, CFG.BLOOM_THRESHOLD
+  );
+  composer.addPass(bloom);
+  composer.addPass(new OutputPass());
+
+  const VignetteShader = {
+    uniforms: { tDiffuse: { value: null }, uAmount: { value: CFG.VIGNETTE } },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform sampler2D tDiffuse; uniform float uAmount; varying vec2 vUv;
+      void main(){
+        vec4 c = texture2D(tDiffuse, vUv);
+        vec2 d = vUv - 0.5;
+        float v = smoothstep(0.85, 0.25, dot(d, d) * uAmount * 2.0);
+        c.rgb *= mix(0.35, 1.0, v);
+        gl_FragColor = c;
+      }`,
+  };
+  composer.addPass(new ShaderPass(VignetteShader));
+
+  // ============================================================
+  //  resize
+  // ============================================================
+  function onResize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    const pr = Math.min(window.devicePixelRatio, 2);
+    renderer.setPixelRatio(pr); renderer.setSize(w, h);
+    composer.setPixelRatio(pr); composer.setSize(w, h);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+    bloom.setSize(w, h);
+    for (const m of [nodeMat, pulseMat, sporeMat]) if (m) m.uniforms.uPix.value = pr;
+  }
+  window.addEventListener('resize', onResize);
+
+  // ============================================================
+  //  animation loop
+  // ============================================================
+  const clock = new THREE.Clock();
+  const _pp = new THREE.Vector3();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+    updateCamera(t);
+
+    renderer.toneMappingExposure = look.exposure + (reduceMotion ? 0 : CFG.BREATHE * Math.sin(t * 0.3));
+    const sway = reduceMotion ? 0 : CFG.SWAY;
+    networkGroup.rotation.y = sway * Math.sin(t * 0.08);
+    networkGroup.rotation.x = sway * 0.6 * Math.sin(t * 0.061 + 1.3);
+
+    if (nodeMat) nodeMat.uniforms.uTime.value = t;
+    if (sporeMat) sporeMat.uniforms.uTime.value = t;
+    if (pulsePoints) {
+      const arr = pulsePoints.geometry.attributes.position.array;
+      for (let i = 0; i < pulseData.length; i++) {
+        const d = pulseData[i];
+        const u = ((t * d.spd + d.off) % 1 + 1) % 1;
+        d.curve.getPointAt(u, _pp);
+        arr[i * 3] = _pp.x; arr[i * 3 + 1] = _pp.y; arr[i * 3 + 2] = _pp.z;
+      }
+      pulsePoints.geometry.attributes.position.needsUpdate = true;
+      pulseMat.uniforms.uTime.value = t;
+    }
+    composer.render();
+  }
+  animate();
+
+  // ============================================================
+  //  8. PALETTE PANEL  (live sliders)
+  // ============================================================
+  // colour state held as HSL so the sliders have intuitive ranges
+  const c0 = new THREE.Color();
+  const hslOf = (hex) => { c0.set(hex); const o = {}; c0.getHSL(o); return o; };
+  const defaults = {
+    base: hslOf(CFG.COL_BASE), tip: hslOf(CFG.COL_TIP), node: hslOf(CFG.NODE_JUNC),
+    spore: hslOf(CFG.SPORE_COL), bg: hslOf(CFG.BG),
+    brightBase: CFG.BRIGHT_BASE, brightTip: CFG.BRIGHT_TIP, gold: CFG.GOLD_RANGE,
+    bloom: CFG.BLOOM_STRENGTH, exposure: CFG.EXPOSURE,
+  };
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const state = clone(defaults);
+
+  function applyColor(id) {
+    const { h, s, l } = state[id];
+    const c = new THREE.Color().setHSL(h, s, l);
+    if (id === 'base') tubeMat.uniforms.uBase.value.copy(c);
+    else if (id === 'tip') {
+      tubeMat.uniforms.uTip.value.copy(c);
+      if (pulseMat) pulseMat.uniforms.uTint.value.copy(c).multiplyScalar(1.5);
+    } else if (id === 'node') { if (nodeMat) nodeMat.uniforms.uTint.value.copy(c); }
+    else if (id === 'spore') { if (sporeMat) sporeMat.uniforms.uTint.value.copy(c); }
+    else if (id === 'bg') {
+      scene.background.copy(c); scene.fog.color.copy(c);
+      for (const m of [nodeMat, pulseMat, sporeMat]) if (m) m.uniforms.uFogColor.value.copy(c);
+    }
+    return c;
+  }
+  function applyScalar(id) {
+    const v = state[id];
+    if (id === 'brightBase') tubeMat.uniforms.uBrightBase.value = v;
+    else if (id === 'brightTip') tubeMat.uniforms.uBrightTip.value = v;
+    else if (id === 'gold') tubeMat.uniforms.uGoldRange.value = v;
+    else if (id === 'bloom') bloom.strength = v;
+    else if (id === 'exposure') look.exposure = v;
+  }
+
+  // ---- panel DOM ----
+  const panel = document.createElement('div');
+  panel.id = 'panel';
+  panel.innerHTML = `<header><span class="title">Palette</span><span class="chev">▾</span></header><div class="body"></div>`;
+  document.body.appendChild(panel);
+  const body = panel.querySelector('.body');
+  const header = panel.querySelector('header');
+  header.addEventListener('click', () => panel.classList.toggle('collapsed'));
+  // start collapsed on small screens so the scene is unobstructed
+  if (window.innerWidth < 560) panel.classList.add('collapsed');
+
+  function rangeRow(parent, label, min, max, value, onInput) {
+    const row = document.createElement('div'); row.className = 'ctl';
+    const k = document.createElement('span'); k.className = 'k'; k.textContent = label;
+    const input = document.createElement('input');
+    input.type = 'range'; input.min = min; input.max = max; input.step = (max - min) / 300;
+    input.value = value;
+    input.setAttribute('aria-label', label);
+    const v = document.createElement('span'); v.className = 'v';
+    const fmt = () => { v.textContent = (+input.value).toFixed(2); };
+    fmt();
+    input.addEventListener('input', () => { fmt(); onInput(+input.value); });
+    row.append(k, input, v);
+    parent.appendChild(row);
+    return input;
+  }
+
+  function colorGroup(id, label) {
+    const g = document.createElement('div'); g.className = 'group';
+    const head = document.createElement('div'); head.className = 'row-head';
+    const sw = document.createElement('span'); sw.className = 'swatch';
+    const lab = document.createElement('span'); lab.className = 'label'; lab.textContent = label;
+    head.append(sw, lab); g.appendChild(head);
+    const refresh = () => { const c = applyColor(id); sw.style.background = '#' + c.getHexString(); };
+    rangeRow(g, 'hue', 0, 1, state[id].h, (val) => { state[id].h = val; refresh(); });
+    rangeRow(g, 'sat', 0, 1, state[id].s, (val) => { state[id].s = val; refresh(); });
+    rangeRow(g, 'lum', 0, 1, state[id].l, (val) => { state[id].l = val; refresh(); });
+    body.appendChild(g);
+    refresh();
+    return g;
+  }
+
+  function scalarGroup(label, items) {
+    const g = document.createElement('div'); g.className = 'group';
+    const head = document.createElement('div'); head.className = 'row-head';
+    const lab = document.createElement('span'); lab.className = 'label'; lab.textContent = label;
+    head.appendChild(lab); g.appendChild(head);
+    for (const it of items) rangeRow(g, it.k, it.min, it.max, state[it.id], (val) => { state[it.id] = val; applyScalar(it.id); });
+    body.appendChild(g);
+    return g;
+  }
+
+  colorGroup('base', 'Filaments');
+  colorGroup('tip', 'Fruiting tips');
+  colorGroup('node', 'Junction glow');
+  colorGroup('spore', 'Spores');
+  colorGroup('bg', 'Background / haze');
+  scalarGroup('Light', [
+    { id: 'brightBase', k: 'fil', min: 0, max: 1.5 },
+    { id: 'brightTip',  k: 'tip', min: 0, max: 1.5 },
+    { id: 'gold',       k: 'gold', min: 0.06, max: 1.2 },
+    { id: 'bloom',      k: 'bloom', min: 0, max: 1.5 },
+    { id: 'exposure',   k: 'expo', min: 0.3, max: 1.6 },
+  ]);
+
+  const reset = document.createElement('button');
+  reset.id = 'reset'; reset.textContent = 'Reset palette';
+  reset.addEventListener('click', () => {
+    Object.assign(state, clone(defaults));
+    body.innerHTML = '';
+    colorGroup('base', 'Filaments'); colorGroup('tip', 'Fruiting tips');
+    colorGroup('node', 'Junction glow'); colorGroup('spore', 'Spores');
+    colorGroup('bg', 'Background / haze');
+    scalarGroup('Light', [
+      { id: 'brightBase', k: 'fil', min: 0, max: 1.5 },
+      { id: 'brightTip',  k: 'tip', min: 0, max: 1.5 },
+      { id: 'gold',       k: 'gold', min: 0.06, max: 1.2 },
+      { id: 'bloom',      k: 'bloom', min: 0, max: 1.5 },
+      { id: 'exposure',   k: 'expo', min: 0.3, max: 1.6 },
+    ]);
+    body.appendChild(reset);
+    for (const id of ['base', 'tip', 'node', 'spore', 'bg']) applyColor(id);
+    for (const id of ['brightBase', 'brightTip', 'gold', 'bloom', 'exposure']) applyScalar(id);
+  });
+  body.appendChild(reset);
+  </script>
+</body>
+</html>
