@@ -91,6 +91,20 @@
     }
     #reset:hover { background: rgba(118,241,228,0.08); }
     #reset:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+    /* ---- control hint ---- */
+    #hint {
+      position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 9;
+      color: var(--ink);
+      font: 11px/1.5 ui-monospace, Menlo, Consolas, monospace;
+      letter-spacing: 0.12em; text-transform: uppercase; text-align: center;
+      background: rgba(5,16,18,0.5); border: 1px solid var(--line);
+      padding: 8px 15px; border-radius: 999px; max-width: 92vw;
+      backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+      pointer-events: none; opacity: 0; transition: opacity 0.7s ease;
+    }
+    #hint.show { opacity: 0.82; }
+    #hint b { color: var(--teal); font-weight: 600; }
   </style>
 
   <!-- three.js as ES modules from a CDN. No build step required. -->
@@ -550,67 +564,76 @@
   }
 
   // ============================================================
-  //  6. CAMERA FLIGHT PATH (closed Catmull-Rom through network)
+  //  6. FREE-FLY CAMERA  (WASD move · mouse look · scroll zoom)
   // ============================================================
-  const camPts = [];
-  {
-    const loops = 10;
-    for (let i = 0; i < loops; i++) {
-      const a = (i / loops) * Math.PI * 2;
-      const rad = rrange(0.28, 0.52);
-      camPts.push(new THREE.Vector3(
-        Math.cos(a) * CFG.VOL.x * rad,
-        Math.sin(a * 1.7 + 0.5) * CFG.VOL.y * 0.42 + rrange(-5, 5),
-        Math.sin(a) * CFG.VOL.z * rad
-      ));
-    }
-  }
-  const trunks = [];
-  for (let i = 0; i < nodes.length; i++) if (thick[i] > 0.32) trunks.push(nodes[i].pos);
-  const MINCLEAR = 9;
-  let camCurve = new THREE.CatmullRomCurve3(camPts, true, 'catmullrom', 0.5);
-  if (trunks.length) {
-    const away = new THREE.Vector3(), sp = new THREE.Vector3();
-    for (let pass = 0; pass < 8; pass++) {
-      let moved = false;
-      const N = 260;
-      for (let s = 0; s < N; s++) {
-        camCurve.getPoint(s / N, sp);
-        let near = null, nd = Infinity;
-        for (const tp of trunks) { const d = sp.distanceToSquared(tp); if (d < nd) { nd = d; near = tp; } }
-        nd = Math.sqrt(nd);
-        if (nd >= MINCLEAR) continue;
-        let ci = 0, cd = Infinity;
-        for (let k = 0; k < camPts.length; k++) { const d = camPts[k].distanceToSquared(sp); if (d < cd) { cd = d; ci = k; } }
-        away.copy(camPts[ci]).sub(near);
-        if (away.lengthSq() < 1e-6) away.set(rrange(-1, 1), rrange(-1, 1), rrange(-1, 1));
-        camPts[ci].addScaledVector(away.normalize(), (MINCLEAR - nd) * 0.5);
-        moved = true;
-      }
-      camCurve = new THREE.CatmullRomCurve3(camPts, true, 'catmullrom', 0.5);
-      if (!moved) break;
-    }
-  }
-
   const worldUp = new THREE.Vector3(0, 1, 0);
-  const _pos = new THREE.Vector3(), _ahead = new THREE.Vector3(), _prev = new THREE.Vector3();
-  const _tan = new THREE.Vector3(), _accel = new THREE.Vector3(), _right = new THREE.Vector3(), _up = new THREE.Vector3();
-  const _look = new THREE.Vector3();
 
-  function updateCamera(t) {
-    const lt = ((t * CFG.CAM_SPEED) % 1 + 1) % 1;
-    camCurve.getPointAt(lt, _pos);
-    camCurve.getPointAt((lt + CFG.CAM_LOOKAHEAD) % 1, _ahead);
-    camCurve.getPointAt((lt - 0.01 + 1) % 1, _prev);
-    _tan.copy(_ahead).sub(_pos).normalize();
-    _accel.copy(_ahead).add(_prev).addScaledVector(_pos, -2);
-    _right.copy(_tan).cross(worldUp).normalize();
-    const roll = THREE.MathUtils.clamp(_accel.dot(_right) * CFG.CAM_BANK, -CFG.CAM_MAXROLL, CFG.CAM_MAXROLL);
-    _up.copy(worldUp).applyAxisAngle(_tan, roll).normalize();
-    camera.position.copy(_pos);
-    camera.up.copy(_up);
-    camCurve.getPointAt((lt + CFG.CAM_LOOKAHEAD * 1.6) % 1, _look);
-    camera.lookAt(_look);
+  // start near the edge looking toward the dense centre
+  camera.rotation.order = 'YXZ';
+  camera.position.set(0, 6, 58);
+  let yaw = 0, pitch = -0.06;          // radians (YXZ euler)
+  const LOOK_SENS = 0.0022;            // mouse sensitivity
+  const fly = { speed: 22 };           // units/sec, driven by the panel slider
+
+  // nudge the start point clear of any thick trunk so we don't begin inside a tube
+  {
+    const trunks = [];
+    for (let i = 0; i < nodes.length; i++) if (thick[i] > 0.32) trunks.push(nodes[i].pos);
+    for (let it = 0; it < 16; it++) {
+      let near = null, nd = Infinity;
+      for (const tp of trunks) { const d = camera.position.distanceToSquared(tp); if (d < nd) { nd = d; near = tp; } }
+      nd = Math.sqrt(nd);
+      if (!near || nd >= 9) break;
+      const a = camera.position.clone().sub(near);
+      if (a.lengthSq() < 1e-6) a.set(0, 1, 0);
+      camera.position.addScaledVector(a.normalize(), (9 - nd) * 0.9);
+    }
+  }
+
+  // --- keyboard ---
+  const keys = Object.create(null);
+  addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'Space') e.preventDefault(); });
+  addEventListener('keyup',   (e) => { keys[e.code] = false; });
+  addEventListener('blur',    () => { for (const k in keys) keys[k] = false; });
+
+  // --- mouse look via pointer lock (click scene to capture, Esc to release) ---
+  canvas.addEventListener('click', () => {
+    if (document.pointerLockElement !== canvas) {
+      const r = canvas.requestPointerLock();
+      if (r && r.catch) r.catch(() => {});   // ignore if the browser denies lock
+    }
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (document.pointerLockElement !== canvas) return;
+    yaw   -= e.movementX * LOOK_SENS;
+    pitch -= e.movementY * LOOK_SENS;
+    pitch = Math.max(-1.5, Math.min(1.5, pitch));
+  });
+
+  // --- scroll = zoom (field of view) ---
+  addEventListener('wheel', (e) => {
+    if (panel && panel.contains(e.target)) return;   // let the panel scroll instead
+    camera.fov = THREE.MathUtils.clamp(camera.fov + e.deltaY * 0.03, 22, 85);
+    camera.updateProjectionMatrix();
+  }, { passive: true });
+
+  const _fwd = new THREE.Vector3(), _rgt = new THREE.Vector3(), _mov = new THREE.Vector3();
+  function updateCamera(dt) {
+    camera.rotation.set(pitch, yaw, 0);
+    camera.getWorldDirection(_fwd);
+    _rgt.copy(_fwd).cross(worldUp).normalize();
+    _mov.set(0, 0, 0);
+    if (keys['KeyW']) _mov.add(_fwd);
+    if (keys['KeyS']) _mov.sub(_fwd);
+    if (keys['KeyD']) _mov.add(_rgt);
+    if (keys['KeyA']) _mov.sub(_rgt);
+    if (keys['Space'] || keys['KeyE']) _mov.add(worldUp);   // ascend
+    if (keys['KeyQ'] || keys['KeyC']) _mov.sub(worldUp);    // descend
+    if (_mov.lengthSq() > 0) {
+      _mov.normalize();
+      const boost = (keys['ShiftLeft'] || keys['ShiftRight']) ? 3 : 1;
+      camera.position.addScaledVector(_mov, fly.speed * boost * dt);
+    }
   }
 
   // ============================================================
@@ -659,11 +682,13 @@
   // ============================================================
   const clock = new THREE.Clock();
   const _pp = new THREE.Vector3();
+  let prevT = 0;
 
   function animate() {
     requestAnimationFrame(animate);
     const t = clock.getElapsedTime();
-    updateCamera(t);
+    const dt = Math.min(0.05, t - prevT); prevT = t;   // clamp to avoid jumps after a stall
+    updateCamera(dt);
 
     renderer.toneMappingExposure = look.exposure + (reduceMotion ? 0 : CFG.BREATHE * Math.sin(t * 0.3));
     const sway = reduceMotion ? 0 : CFG.SWAY;
@@ -729,7 +754,7 @@
   // ---- panel DOM ----
   const panel = document.createElement('div');
   panel.id = 'panel';
-  panel.innerHTML = `<header><span class="title">Palette</span><span class="chev">▾</span></header><div class="body"></div>`;
+  panel.innerHTML = `<header><span class="title">Controls</span><span class="chev">▾</span></header><div class="body"></div>`;
   document.body.appendChild(panel);
   const body = panel.querySelector('.body');
   const header = panel.querySelector('header');
@@ -778,39 +803,64 @@
     return g;
   }
 
-  colorGroup('base', 'Filaments');
-  colorGroup('tip', 'Fruiting tips');
-  colorGroup('node', 'Junction glow');
-  colorGroup('spore', 'Spores');
-  colorGroup('bg', 'Background / haze');
-  scalarGroup('Light', [
+  // Flight-speed group (its own state so the palette Reset doesn't touch it)
+  function flightGroup() {
+    const g = document.createElement('div'); g.className = 'group';
+    const head = document.createElement('div'); head.className = 'row-head';
+    const lab = document.createElement('span'); lab.className = 'label'; lab.textContent = 'Flight';
+    head.appendChild(lab); g.appendChild(head);
+    rangeRow(g, 'speed', 2, 120, fly.speed, (val) => { fly.speed = val; });
+    body.appendChild(g);
+    return g;
+  }
+
+  const LIGHT_ITEMS = [
     { id: 'brightBase', k: 'fil', min: 0, max: 1.5 },
     { id: 'brightTip',  k: 'tip', min: 0, max: 1.5 },
     { id: 'gold',       k: 'gold', min: 0.06, max: 1.2 },
     { id: 'bloom',      k: 'bloom', min: 0, max: 1.5 },
     { id: 'exposure',   k: 'expo', min: 0.3, max: 1.6 },
-  ]);
+  ];
+
+  function buildBody() {
+    body.innerHTML = '';
+    flightGroup();
+    colorGroup('base', 'Filaments');
+    colorGroup('tip', 'Fruiting tips');
+    colorGroup('node', 'Junction glow');
+    colorGroup('spore', 'Spores');
+    colorGroup('bg', 'Background / haze');
+    scalarGroup('Light', LIGHT_ITEMS);
+    body.appendChild(reset);
+  }
 
   const reset = document.createElement('button');
   reset.id = 'reset'; reset.textContent = 'Reset palette';
   reset.addEventListener('click', () => {
     Object.assign(state, clone(defaults));
-    body.innerHTML = '';
-    colorGroup('base', 'Filaments'); colorGroup('tip', 'Fruiting tips');
-    colorGroup('node', 'Junction glow'); colorGroup('spore', 'Spores');
-    colorGroup('bg', 'Background / haze');
-    scalarGroup('Light', [
-      { id: 'brightBase', k: 'fil', min: 0, max: 1.5 },
-      { id: 'brightTip',  k: 'tip', min: 0, max: 1.5 },
-      { id: 'gold',       k: 'gold', min: 0.06, max: 1.2 },
-      { id: 'bloom',      k: 'bloom', min: 0, max: 1.5 },
-      { id: 'exposure',   k: 'expo', min: 0.3, max: 1.6 },
-    ]);
-    body.appendChild(reset);
+    buildBody();
     for (const id of ['base', 'tip', 'node', 'spore', 'bg']) applyColor(id);
     for (const id of ['brightBase', 'brightTip', 'gold', 'bloom', 'exposure']) applyScalar(id);
   });
-  body.appendChild(reset);
+  buildBody();
+
+  // ============================================================
+  //  9. CONTROL HINT  (fades in on load, out once you take over)
+  // ============================================================
+  const hint = document.createElement('div');
+  hint.id = 'hint';
+  hint.innerHTML = `<b>Click</b> to look &nbsp;·&nbsp; <b>WASD</b> to fly &nbsp;·&nbsp; <b>Q/E</b> up·down &nbsp;·&nbsp; <b>Shift</b> boost &nbsp;·&nbsp; <b>Scroll</b> zoom &nbsp;·&nbsp; <b>Esc</b> for menu`;
+  document.body.appendChild(hint);
+  requestAnimationFrame(() => hint.classList.add('show'));
+  let hintTimer = setTimeout(() => hint.classList.remove('show'), 7000);
+  function dismissHint() {
+    clearTimeout(hintTimer);
+    hint.classList.remove('show');
+    removeEventListener('keydown', dismissHint);
+    document.removeEventListener('pointerlockchange', dismissHint);
+  }
+  addEventListener('keydown', dismissHint);
+  document.addEventListener('pointerlockchange', dismissHint);
   </script>
 </body>
 </html>
