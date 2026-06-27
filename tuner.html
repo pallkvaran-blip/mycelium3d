@@ -153,6 +153,12 @@
     FOG_NEAR: 6, FOG_FAR: 95, EXPOSURE: 0.85, BREATHE: 0.04,
     BLOOM_STRENGTH: 0.42, BLOOM_RADIUS: 0.5, BLOOM_THRESHOLD: 0.6, VIGNETTE: 1.05,
 
+    // --- "underground" layer (replaces plain fog): depth murk + suspended sediment ---
+    MURK: 1.15,            // how strongly distance is swallowed by the surrounding earth
+    DUST: 0.55,            // opacity of the floating sediment layer (0 = off)
+    DUST_COL: 0x7a7567,    // muted earthy tone of the suspended motes
+    DUST_COUNT: 1800,
+
     CAM_SPEED: 0.0078, CAM_LOOKAHEAD: 0.013, CAM_BANK: 1.5, CAM_MAXROLL: 0.5,
     SPORES: 850, PULSES: 130, NODE_PULSE_SPEED: 1.4, SWAY: 0.012,
   };
@@ -187,14 +193,15 @@
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(CFG.BG);
-  scene.fog = new THREE.Fog(CFG.BG, CFG.FOG_NEAR, CFG.FOG_FAR);
+  // No THREE.Fog — depth is handled by an adjustable "murk" in each material,
+  // and the underground feeling comes from the suspended sediment layer below.
 
   const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 600);
 
   const networkGroup = new THREE.Group();
   scene.add(networkGroup);
 
-  let nodeMat = null, pulseMat = null, sporeMat = null, tubeMat = null;
+  let nodeMat = null, pulseMat = null, sporeMat = null, tubeMat = null, dustMat = null;
 
   // ============================================================
   //  1. SPACE COLONIZATION  ->  organic branching network
@@ -372,41 +379,38 @@
 
   // tube material: tip-warmth + brightness derived from aR, all via uniforms
   tubeMat = new THREE.ShaderMaterial({
-    fog: true,
-    uniforms: THREE.UniformsUtils.merge([
-      THREE.UniformsLib.fog,
-      {
-        uBase:       { value: new THREE.Color(CFG.COL_BASE) },
-        uTip:        { value: new THREE.Color(CFG.COL_TIP) },
-        uBrightBase: { value: CFG.BRIGHT_BASE },
-        uBrightTip:  { value: CFG.BRIGHT_TIP },
-        uGoldRange:  { value: CFG.GOLD_RANGE },
-        uRTip:       { value: CFG.R_TIP },
-      },
-    ]),
+    uniforms: {
+      uBase:       { value: new THREE.Color(CFG.COL_BASE) },
+      uTip:        { value: new THREE.Color(CFG.COL_TIP) },
+      uBrightBase: { value: CFG.BRIGHT_BASE },
+      uBrightTip:  { value: CFG.BRIGHT_TIP },
+      uGoldRange:  { value: CFG.GOLD_RANGE },
+      uRTip:       { value: CFG.R_TIP },
+      uFogColor:   { value: new THREE.Color(CFG.BG) },
+      uFogNear:    { value: CFG.FOG_NEAR },
+      uFogFar:     { value: CFG.FOG_FAR },
+      uMurk:       { value: CFG.MURK },
+    },
     vertexShader: `
-      #include <common>
-      #include <fog_pars_vertex>
       attribute float aR;
       uniform vec3 uBase, uTip;
       uniform float uBrightBase, uBrightTip, uGoldRange, uRTip;
-      varying vec3 vColor;
+      varying vec3 vColor; varying float vDepth;
       void main() {
         float tip = clamp(1.0 - (aR - uRTip) / uGoldRange, 0.0, 1.0);
         vec3 col = mix(uBase, uTip, pow(tip, 1.3));
         float bright = mix(uBrightBase, uBrightTip, pow(tip, 1.2));
         vColor = col * bright;
         vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        vDepth = -mvPosition.z;
         gl_Position = projectionMatrix * mvPosition;
-        #include <fog_vertex>
       }`,
     fragmentShader: `
-      #include <common>
-      #include <fog_pars_fragment>
-      varying vec3 vColor;
+      uniform vec3 uFogColor; uniform float uFogNear, uFogFar, uMurk;
+      varying vec3 vColor; varying float vDepth;
       void main() {
-        gl_FragColor = vec4(vColor, 1.0);
-        #include <fog_fragment>
+        float f = clamp(smoothstep(uFogNear, uFogFar, vDepth) * uMurk, 0.0, 1.0);
+        gl_FragColor = vec4(mix(vColor, uFogColor, f), 1.0);
       }`,
   });
 
@@ -440,18 +444,19 @@
         uTex: { value: glowTex }, uTime: { value: 0 }, uPix: { value: renderer.getPixelRatio() },
         uSize: { value: size }, uTint: { value: tint.clone() },
         uFogColor: { value: new THREE.Color(CFG.BG) }, uFogNear: { value: CFG.FOG_NEAR }, uFogFar: { value: CFG.FOG_FAR },
+        uMurk: { value: CFG.MURK },
       },
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
       vertexShader: `
         attribute float aScale; attribute float aPhase;
-        uniform float uTime, uPix, uSize, uFogNear, uFogFar;
+        uniform float uTime, uPix, uSize, uFogNear, uFogFar, uMurk;
         varying float vFog;
         void main(){
           float pulse = 0.65 + 0.35 * sin(uTime * ${CFG.NODE_PULSE_SPEED.toFixed(3)} + aPhase);
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
           float sz = uSize * aScale * pulse * uPix * (300.0 / max(0.001, -mv.z));
           gl_PointSize = min(sz, 26.0 * uPix);
-          vFog = smoothstep(uFogNear, uFogFar, -mv.z);
+          vFog = clamp(smoothstep(uFogNear, uFogFar, -mv.z) * uMurk, 0.0, 1.0);
           gl_Position = projectionMatrix * mv;
         }`,
       fragmentShader: `
@@ -530,11 +535,12 @@
         uTex: { value: glowTex }, uTime: { value: 0 }, uPix: { value: renderer.getPixelRatio() },
         uTint: { value: new THREE.Color(CFG.SPORE_COL) },
         uFogColor: { value: new THREE.Color(CFG.BG) }, uFogNear: { value: CFG.FOG_NEAR }, uFogFar: { value: CFG.FOG_FAR },
+        uMurk: { value: CFG.MURK },
       },
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
       vertexShader: `
         attribute float aScale, aPhase, aAmp, aBri;
-        uniform float uTime, uPix, uFogNear, uFogFar;
+        uniform float uTime, uPix, uFogNear, uFogFar, uMurk;
         varying float vFog, vTw, vBri;
         void main(){
           vBri = aBri;
@@ -546,7 +552,7 @@
           vec4 mv = modelViewMatrix * vec4(p, 1.0);
           float sz = 4.0 * aScale * uPix * (300.0 / max(0.001, -mv.z));
           gl_PointSize = min(sz, 16.0 * uPix);
-          vFog = smoothstep(uFogNear, uFogFar, -mv.z);
+          vFog = clamp(smoothstep(uFogNear, uFogFar, -mv.z) * uMurk, 0.0, 1.0);
           gl_Position = projectionMatrix * mv;
         }`,
       fragmentShader: `
@@ -561,6 +567,62 @@
     const spores = new THREE.Points(g, sporeMat);
     spores.frustumCulled = false;
     scene.add(spores);
+  }
+
+  // ============================================================
+  //  5b. UNDERGROUND SEDIMENT  (suspended dust that surrounds the
+  //      camera, so it always feels buried in earth — replaces fog)
+  // ============================================================
+  {
+    const n = CFG.DUST_COUNT, L = 64;     // motes wrap inside an L-sized box that follows the camera
+    const pos = [], scl = [], seed = [];
+    for (let i = 0; i < n; i++) {
+      pos.push(rnd() * L, rnd() * L, rnd() * L);
+      scl.push(rrange(0.5, 1.9));
+      seed.push(rrange(0, Math.PI * 2));
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aScale', new THREE.Float32BufferAttribute(scl, 1));
+    g.setAttribute('aSeed', new THREE.Float32BufferAttribute(seed, 1));
+    dustMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTex: { value: glowTex }, uTime: { value: 0 }, uPix: { value: renderer.getPixelRatio() },
+        uCamPos: { value: new THREE.Vector3() }, uL: { value: L }, uOpacity: { value: CFG.DUST },
+        uColor: { value: new THREE.Color(CFG.DUST_COL) },
+        uFogColor: { value: new THREE.Color(CFG.BG) }, uFogNear: { value: CFG.FOG_NEAR }, uFogFar: { value: CFG.FOG_FAR }, uMurk: { value: CFG.MURK },
+      },
+      transparent: true, depthWrite: false, blending: THREE.NormalBlending,
+      vertexShader: `
+        attribute float aScale, aSeed;
+        uniform float uTime, uPix, uL, uMurk, uFogNear, uFogFar;
+        uniform vec3 uCamPos;
+        varying float vFog, vEdge;
+        void main(){
+          vec3 drift = vec3(sin(uTime * 0.13 + aSeed) * 1.6, -uTime * 1.1, cos(uTime * 0.11 + aSeed) * 1.6);
+          vec3 rel = position + drift - uCamPos;
+          rel = mod(rel + 0.5 * uL, uL) - 0.5 * uL;            // wrap into a box centred on the camera
+          vec3 world = uCamPos + rel;
+          vEdge = smoothstep(0.5 * uL, 0.30 * uL, length(rel)); // fade toward the box edge to hide wrapping
+          vec4 mv = modelViewMatrix * vec4(world, 1.0);
+          float sz = 3.2 * aScale * uPix * (300.0 / max(0.001, -mv.z));
+          gl_PointSize = min(sz, 22.0 * uPix);
+          vFog = clamp(smoothstep(uFogNear, uFogFar, -mv.z) * uMurk, 0.0, 1.0);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform sampler2D uTex; uniform vec3 uColor, uFogColor; uniform float uOpacity;
+        varying float vFog, vEdge;
+        void main(){
+          vec4 t = texture2D(uTex, gl_PointCoord);
+          vec3 col = mix(uColor, uFogColor, vFog);
+          float a = t.a * uOpacity * vEdge * (1.0 - vFog * 0.6);
+          gl_FragColor = vec4(col, a);
+        }`,
+    });
+    const dust = new THREE.Points(g, dustMat);
+    dust.frustumCulled = false;
+    scene.add(dust);
   }
 
   // ============================================================
@@ -673,7 +735,7 @@
     composer.setPixelRatio(pr); composer.setSize(w, h);
     camera.aspect = w / h; camera.updateProjectionMatrix();
     bloom.setSize(w, h);
-    for (const m of [nodeMat, pulseMat, sporeMat]) if (m) m.uniforms.uPix.value = pr;
+    for (const m of [nodeMat, pulseMat, sporeMat, dustMat]) if (m) m.uniforms.uPix.value = pr;
   }
   window.addEventListener('resize', onResize);
 
@@ -697,6 +759,7 @@
 
     if (nodeMat) nodeMat.uniforms.uTime.value = t;
     if (sporeMat) sporeMat.uniforms.uTime.value = t;
+    if (dustMat) { dustMat.uniforms.uTime.value = t; dustMat.uniforms.uCamPos.value.copy(camera.position); }
     if (pulsePoints) {
       const arr = pulsePoints.geometry.attributes.position.array;
       for (let i = 0; i < pulseData.length; i++) {
@@ -723,6 +786,7 @@
     spore: hslOf(CFG.SPORE_COL), bg: hslOf(CFG.BG),
     brightBase: CFG.BRIGHT_BASE, brightTip: CFG.BRIGHT_TIP, gold: CFG.GOLD_RANGE,
     bloom: CFG.BLOOM_STRENGTH, exposure: CFG.EXPOSURE,
+    dust: CFG.DUST, murk: CFG.MURK,
   };
   const clone = (o) => JSON.parse(JSON.stringify(o));
   const state = clone(defaults);
@@ -737,8 +801,9 @@
     } else if (id === 'node') { if (nodeMat) nodeMat.uniforms.uTint.value.copy(c); }
     else if (id === 'spore') { if (sporeMat) sporeMat.uniforms.uTint.value.copy(c); }
     else if (id === 'bg') {
-      scene.background.copy(c); scene.fog.color.copy(c);
-      for (const m of [nodeMat, pulseMat, sporeMat]) if (m) m.uniforms.uFogColor.value.copy(c);
+      scene.background.copy(c);
+      tubeMat.uniforms.uFogColor.value.copy(c);
+      for (const m of [nodeMat, pulseMat, sporeMat, dustMat]) if (m) m.uniforms.uFogColor.value.copy(c);
     }
     return c;
   }
@@ -749,6 +814,10 @@
     else if (id === 'gold') tubeMat.uniforms.uGoldRange.value = v;
     else if (id === 'bloom') bloom.strength = v;
     else if (id === 'exposure') look.exposure = v;
+    else if (id === 'dust') { if (dustMat) dustMat.uniforms.uOpacity.value = v; }
+    else if (id === 'murk') {
+      for (const m of [tubeMat, nodeMat, pulseMat, sporeMat, dustMat]) if (m) m.uniforms.uMurk.value = v;
+    }
   }
 
   // ---- panel DOM ----
@@ -822,6 +891,11 @@
     { id: 'exposure',   k: 'expo', min: 0.3, max: 1.6 },
   ];
 
+  const UG_ITEMS = [
+    { id: 'dust',  k: 'dust', min: 0, max: 1 },
+    { id: 'murk',  k: 'murk', min: 0, max: 2.5 },
+  ];
+
   function buildBody() {
     body.innerHTML = '';
     flightGroup();
@@ -830,6 +904,7 @@
     colorGroup('node', 'Junction glow');
     colorGroup('spore', 'Spores');
     colorGroup('bg', 'Background / haze');
+    scalarGroup('Underground', UG_ITEMS);
     scalarGroup('Light', LIGHT_ITEMS);
     body.appendChild(reset);
   }
@@ -840,7 +915,7 @@
     Object.assign(state, clone(defaults));
     buildBody();
     for (const id of ['base', 'tip', 'node', 'spore', 'bg']) applyColor(id);
-    for (const id of ['brightBase', 'brightTip', 'gold', 'bloom', 'exposure']) applyScalar(id);
+    for (const id of ['brightBase', 'brightTip', 'gold', 'bloom', 'exposure', 'dust', 'murk']) applyScalar(id);
   });
   buildBody();
 
